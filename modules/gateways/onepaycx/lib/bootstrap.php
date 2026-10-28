@@ -13,7 +13,10 @@
  */
 
 if (!defined('ONEPAYCX_WHMCS_VERSION')) {
-    define('ONEPAYCX_WHMCS_VERSION', '1.0.0');
+    define('ONEPAYCX_WHMCS_VERSION', '1.1.0');
+}
+if (!defined('ONEPAYCX_SIG_TOLERANCE')) {
+    define('ONEPAYCX_SIG_TOLERANCE', 300);    // seconds of clock skew/age a V2 signature may have
 }
 if (!defined('ONEPAYCX_API_BASE')) {
     define('ONEPAYCX_API_BASE', 'https://api.1pay.cx');   // REST API host (calls /v1/...)

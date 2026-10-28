@@ -3,12 +3,21 @@
 Accept card, Bitcoin and Monero payments on WHMCS invoices with [1pay.cx](https://1pay.cx).
 Buyers pay on the hosted 1pay.cx checkout; you settle in crypto. Paste your API key and go live.
 
-* Version 1.0.0 — third-party gateway module for **WHMCS 8.x** on **PHP 8.1+** (cURL required).
+* Version 1.1.0 — third-party gateway module for **WHMCS 8.x** on **PHP 8.1+** (cURL required).
 * Adds a **Pay with 1pay.cx** button to every unpaid invoice.
 * Invoices are marked paid automatically by a signed webhook — no manual reconciliation.
 * The buyer's return trip also checks the payment, so the invoice updates even if the webhook is delayed.
 * No card data ever touches your server. All traffic goes to `https://api.1pay.cx` and `https://1pay.cx` only.
 * Licence: MIT (see `LICENSE`).
+
+## Webhook setup
+
+This plugin supplies `notifyUrl` for each payment and obtains the account's signing secret
+from `GET /v1/me` for the configured API key's mode. No registered webhook endpoint is
+required. Payments with `notifyUrl` send their events only to that callback; registered
+endpoints are skipped for those payments and can remain saved for other integrations. To verify order updates, create a test order
+with a test API key and simulate payment; the registered-endpoint test button does not
+exercise this callback flow.
 
 ## Files
 
@@ -71,9 +80,9 @@ An invoice is credited with the amount the module asked 1pay.cx to charge — th
 `mod_onepaycx_payments` when the payment was created — never the API's `amount`, which includes any
 **customer surcharge** configured on the 1pay.cx side (a merchant with a 3% surcharge invoicing 10.00 sees a
 10.30 payment; the invoice is credited 10.00). The API row's currency must match the recorded one, otherwise
-nothing is credited and the Gateway Log shows `Unsuccessful` with `currency mismatch`. Only when no local
-record exists (the table could not be created) is the API amount used, and then still only if its currency
-matches the invoice's expected currency.
+nothing is credited and the Gateway Log shows `Unsuccessful` with `currency mismatch`. A payment the API
+reports below the recorded amount (by more than 0.01) is refused as `amount mismatch`. A payment with no local
+record is never credited (`unknown payment`).
 
 Crediting is serialised through the payment row: it is moved to `crediting` with an atomic compare-and-set
 before `addInvoicePayment`, so the webhook and the buyer's return trip — which routinely arrive within the
@@ -91,6 +100,15 @@ The conversion uses the currency the payment was created in (from the module's o
 ### Security notes
 
 * The signature is checked over the raw request body, in constant time, before anything is parsed or acted on.
+  When `X-1pay-Signature-V2: t=…,v1=…` is present it is the one checked (HMAC over `"<t>.<body>"`), and a
+  timestamp more than 300 seconds from the server clock is rejected, so a captured delivery cannot be
+  replayed. The legacy `X-1pay-Signature` is used only when V2 is absent.
+* A signed notify is only a hint: the payment is re-read with `GET /v1/payments/{id}` using the configured key
+  and credited only if it is `paid`, belongs to the invoice recorded for that payment id, and matches the
+  recorded currency and amount. If the re-read fails or the payment is not yet paid, the notify gets a
+  non-2xx reply so it is redelivered.
+* A live key (not `pk_test_…`) never credits a test payment (`livemode: false`); test payments are signed with
+  the separate test secret, which `GET /v1/me` returns only for a `pk_test_` key.
 * The webhook secret is stored in `tblpaymentgateways` (encrypted with WHMCS's `encrypt()` when available),
   tied to a fingerprint of the API key so a changed key triggers a refetch. If a signature does not verify,
   the secret is refetched from `GET /v1/me` at most once a minute (covers rotation) and re-checked.
@@ -137,12 +155,19 @@ module) and the buyer return (paid with a surcharged API amount, revisit without
 reference mismatch, expired, no local record, currency mismatch, Convert To, bad input).
 
 ```bash
-php test/run.php      # exit 0 and "PASS" = good
+php plugins/whmcs/test/run.php      # exit 0 and "PASS" = good
 ```
 
 Run it before shipping any change to the module.
 
 ## Changelog
+
+### 1.1.0
+* Webhook: verifies the timestamped `X-1pay-Signature-V2` (300 s window) when present, falls back to the
+  legacy header otherwise.
+* Webhook: only payments this module recorded are credited; every notify is re-read via
+  `GET /v1/payments/{id}` and must be `paid`, for the recorded invoice, in the recorded currency and not short.
+* Live keys refuse test (`livemode: false`) payments, on the webhook and the buyer return.
 
 ### 1.0.0
 * Initial release: invoice button, signed webhook, buyer-return polling, Convert To support.

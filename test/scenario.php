@@ -8,7 +8,7 @@
  * Environment (set by run.php): ONEPAYCX_TEST_ROOT (fake WHMCS root),
  * ONEPAYCX_TEST_LOG, ONEPAYCX_TEST_DB, ONEPAYCX_TEST_TRANSPORT, ONEPAYCX_TEST_APIKEY,
  * ONEPAYCX_TEST_LINKMETHOD (the module's "Payment method" setting for link()),
- * and for callback scenarios ONEPAYCX_TEST_METHOD / _QUERY / _SIG / _BODY.
+ * and for callback scenarios ONEPAYCX_TEST_METHOD / _QUERY / _SIG / _SIG2 / _BODY.
  *
  * @license MIT
  */
@@ -61,6 +61,9 @@ $_GET = $query;
 $_SERVER['REQUEST_METHOD'] = getenv('ONEPAYCX_TEST_METHOD') ?: 'POST';
 if (getenv('ONEPAYCX_TEST_SIG') !== false && getenv('ONEPAYCX_TEST_SIG') !== '') {
     $_SERVER['HTTP_X_1PAY_SIGNATURE'] = getenv('ONEPAYCX_TEST_SIG');
+}
+if (getenv('ONEPAYCX_TEST_SIG2') !== false && getenv('ONEPAYCX_TEST_SIG2') !== '') {
+    $_SERVER['HTTP_X_1PAY_SIGNATURE_V2'] = getenv('ONEPAYCX_TEST_SIG2');
 }
 define('ONEPAYCX_INPUT_STREAM', (string) getenv('ONEPAYCX_TEST_BODY'));
 

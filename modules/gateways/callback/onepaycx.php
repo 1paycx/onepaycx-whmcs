@@ -6,9 +6,15 @@
  * two ways:
  *
  *  1. Signed notify (POST, no `action`): 1pay.cx sends { event, data, at } with
- *     `X-1pay-Signature` = hex HMAC-SHA256 of the RAW body under the merchant's
- *     webhook secret. On `payment.paid` the invoice named by `data.reference` is
- *     credited. Deliveries are at-least-once, so a repeat is a harmless no-op.
+ *     `X-1pay-Signature-V2: t=<unix>,v1=<hex HMAC-SHA256("<t>.<body>")>` (checked,
+ *     with a 300 s clock window, whenever present) and the legacy
+ *     `X-1pay-Signature` = hex HMAC-SHA256 of the RAW body (used only when V2 is
+ *     absent), both under the webhook secret for the key's mode. On
+ *     `payment.paid` the payment must be one this module recorded; it is then
+ *     re-read via GET /v1/payments/{id} with the configured key and credited
+ *     only if that says paid, for the recorded invoice, in the recorded
+ *     currency and not short. A live key never accepts a test (livemode:false)
+ *     payment. Deliveries are at-least-once, so a repeat is a harmless no-op.
  *
  *  2. Buyer return (GET, `action=return&invoiceid=N`): the hosted checkout sends
  *     the buyer back here after paying. If the notify has not landed yet, the
@@ -75,49 +81,85 @@ function onepaycx_cb_raw_body()
     return $body === false ? '' : $body;
 }
 
-/** The X-1pay-Signature header, lower-cased hex or ''. */
-function onepaycx_cb_signature()
+/** A request header by its HTTP name (e.g. "X-1pay-Signature"), trimmed, or ''. */
+function onepaycx_cb_header($name)
 {
-    $sig = '';
-    if (isset($_SERVER['HTTP_X_1PAY_SIGNATURE'])) {
-        $sig = (string) $_SERVER['HTTP_X_1PAY_SIGNATURE'];
-    } elseif (function_exists('getallheaders')) {
-        foreach ((array) getallheaders() as $name => $value) {
-            if (strtolower((string) $name) === 'x-1pay-signature') {
-                $sig = (string) $value;
-                break;
+    $key = 'HTTP_' . strtoupper(str_replace('-', '_', (string) $name));
+    if (isset($_SERVER[$key])) {
+        return trim((string) $_SERVER[$key]);
+    }
+    if (function_exists('getallheaders')) {
+        foreach ((array) getallheaders() as $n => $value) {
+            if (strtolower((string) $n) === strtolower((string) $name)) {
+                return trim((string) $value);
             }
         }
     }
-    $sig = strtolower(trim($sig));
+    return '';
+}
+
+/** The legacy X-1pay-Signature header, lower-cased hex or ''. */
+function onepaycx_cb_signature()
+{
+    $sig = strtolower(onepaycx_cb_header('X-1pay-Signature'));
     return ($sig !== '' && ctype_xdigit($sig)) ? $sig : '';
 }
 
-/** Constant-time comparison of the expected HMAC with the presented one. */
-function onepaycx_cb_signature_ok($rawBody, $signature, $secret)
+/**
+ * The X-1pay-Signature-V2 header ("t=<unix>,v1=<hex>") parsed into
+ * ['t' => int, 'v1' => hex], null when absent, false when present but malformed.
+ */
+function onepaycx_cb_signature_v2()
 {
-    if ($secret === '' || $signature === '') {
+    $raw = onepaycx_cb_header('X-1pay-Signature-V2');
+    if ($raw === '') {
+        return null;
+    }
+    $t = null;
+    $v1 = '';
+    foreach (explode(',', $raw) as $part) {
+        $kv = explode('=', trim($part), 2);
+        if (count($kv) !== 2) {
+            continue;
+        }
+        if ($kv[0] === 't' && preg_match('/^\d{1,12}$/', $kv[1])) {
+            $t = (int) $kv[1];
+        } elseif ($kv[0] === 'v1' && ctype_xdigit($kv[1])) {
+            $v1 = strtolower($kv[1]);
+        }
+    }
+    return ($t === null || $v1 === '') ? false : array('t' => $t, 'v1' => $v1);
+}
+
+/**
+ * Verify the notify signature. When the V2 header is present it is the only one
+ * consulted: HMAC over "<t>.<body>" and |now - t| <= ONEPAYCX_SIG_TOLERANCE, so a
+ * captured delivery cannot be replayed later. Otherwise the legacy body-only HMAC.
+ */
+function onepaycx_cb_signature_ok($rawBody, $sig, $secret)
+{
+    if ($secret === '' || $sig === '' || $sig === null || $sig === false) {
         return false;
     }
-    $expected = hash_hmac('sha256', $rawBody, $secret);
-    return hash_equals($expected, $signature);
+    if (is_array($sig)) {
+        if (abs(time() - $sig['t']) > ONEPAYCX_SIG_TOLERANCE) {
+            return false;
+        }
+        return hash_equals(hash_hmac('sha256', $sig['t'] . '.' . $rawBody, $secret), $sig['v1']);
+    }
+    return hash_equals(hash_hmac('sha256', $rawBody, $secret), $sig);
+}
+
+/** Live keys start with anything but pk_test_; a live store never accepts test payments. */
+function onepaycx_cb_is_live_key($apiKey)
+{
+    return strpos((string) $apiKey, 'pk_test_') !== 0;
 }
 
 /** Two-decimal string, e.g. "10.00". */
 function onepaycx_cb_money($amount)
 {
     return number_format((float) $amount, 2, '.', '');
-}
-
-/**
- * The ISO code the invoice is expected to be paid in: the gateway's "Convert To"
- * currency when set, else the client's own currency. '' when it cannot be
- * determined (then no currency check is possible).
- */
-function onepaycx_cb_expected_currency(array $gw, $invoiceId)
-{
-    $currencyId = !empty($gw['convertto']) ? (int) $gw['convertto'] : OnePayCx_Whmcs_Store::invoiceCurrencyId($invoiceId);
-    return $currencyId > 0 ? OnePayCx_Whmcs_Store::currencyCode($currencyId) : '';
 }
 
 /**
@@ -164,8 +206,8 @@ function onepaycx_cb_invoice_amount(array $gw, $invoiceId, $amount, $currency = 
  * source did not carry it)]. It is only trusted for *whether* the payment is
  * paid and in which currency; the amount credited is the one this module
  * recorded when it created the payment (see the file header). Without a local
- * record (table unavailable, or the payment predates it) the API amount is
- * used, after checking its currency against the invoice's expected currency.
+ * record nothing is credited; a short payment (API amount below the recorded
+ * one by more than 0.01) or a currency other than the recorded one is refused.
  *
  * @param string $reason set when 'refused'
  * @return string 'credited' | 'duplicate' | 'refused'
@@ -180,29 +222,24 @@ function onepaycx_cb_credit(array $gw, $invoiceId, $paymentId, array $api, array
     $apiCurrency = isset($api['currency']) ? strtoupper(trim((string) $api['currency'])) : '';
 
     $local = OnePayCx_Whmcs_Store::findByPaymentId($paymentId);
-    if ($local !== null) {
+    $amount = '0.00';
+    $currency = '';
+    if ($local === null) {
+        // Only payments this module created (and recorded) are ever credited.
+        $reason = 'unknown payment';
+    } else {
         if ($local['invoice_id'] !== (int) $invoiceId) {
             $reason = 'invoice mismatch';
-        } elseif ($apiCurrency !== '' && $apiCurrency !== $local['currency']) {
+        } elseif ($apiCurrency === '' || $apiCurrency !== $local['currency']) {
             $reason = 'currency mismatch';
+        } elseif ($apiAmount + 0.01 < (float) $local['amount']) {
+            // Short payment. Higher is fine: that is the customer surcharge the
+            // merchant configured on 1pay.cx, and it is never credited.
+            $reason = 'amount mismatch';
         }
-        // What we asked to be charged. The API figure may be higher (customer
-        // surcharge); it is never credited. Lower would mean a short payment, so
-        // never credit more than was actually paid either.
+        // What we asked to be charged, never the (possibly surcharged) API figure.
         $amount = $local['amount'];
-        if ($apiAmount > 0 && $apiAmount < (float) $amount) {
-            $amount = onepaycx_cb_money($apiAmount);
-        }
         $currency = $local['currency'];
-    } else {
-        $expected = onepaycx_cb_expected_currency($gw, $invoiceId);
-        if ($apiAmount <= 0) {
-            $reason = 'missing amount';
-        } elseif ($apiCurrency !== '' && $expected !== '' && $apiCurrency !== $expected) {
-            $reason = 'currency mismatch';
-        }
-        $amount = onepaycx_cb_money($apiAmount);
-        $currency = $apiCurrency !== '' ? $apiCurrency : $expected;
     }
     if ($reason !== '') {
         logTransaction($gw['name'], array('error' => $reason, 'paymentId' => $paymentId) + $logPayload, 'Unsuccessful');
@@ -251,8 +288,12 @@ function onepaycx_cb_notify(array $gw)
     }
 
     $raw = onepaycx_cb_raw_body();
-    $signature = onepaycx_cb_signature();
-    if ($raw === '' || $signature === '') {
+    // V2 (timestamped) when present; the legacy header only when V2 is absent.
+    $signature = onepaycx_cb_signature_v2();
+    if ($signature === null) {
+        $signature = onepaycx_cb_signature();
+    }
+    if ($raw === '' || $signature === '' || $signature === false) {
         onepaycx_cb_respond(400, 'missing signature');
     }
 
@@ -285,36 +326,51 @@ function onepaycx_cb_notify(array $gw)
         onepaycx_cb_respond(400, 'missing payment id');
     }
 
-    $reference = isset($data['reference']) ? (string) $data['reference'] : '';
-    $amount = isset($data['amount']) && is_numeric($data['amount']) ? (float) $data['amount'] : 0.0;
-    $status = isset($data['status']) ? (string) $data['status'] : 'paid';
-    $currency = isset($data['currency']) ? (string) $data['currency'] : ''; // the notify normally omits it
+    // Acknowledged (200) refusals: redelivering them would never change the answer.
+    $refuse = function ($reason) use ($gw, $paymentId, $payload) {
+        logTransaction($gw['name'], array('error' => $reason, 'paymentId' => $paymentId) + $payload, 'Unsuccessful');
+        onepaycx_cb_respond(200, 'ignored: ' . $reason);
+    };
 
-    // Older or partial payloads: look the payment up (authoritative, server-to-server).
-    if ($reference === '' || $amount <= 0 || $status !== 'paid') {
-        $client = new OnePayCx_Whmcs_Client($apiKey);
-        $res = $client->getPayment($paymentId);
-        if (!$res['ok'] || !is_array($res['data'])) {
-            onepaycx_cb_respond(502, 'could not verify payment');
-        }
-        $reference = isset($res['data']['reference']) ? (string) $res['data']['reference'] : $reference;
-        $amount = isset($res['data']['amount']) ? (float) $res['data']['amount'] : $amount;
-        $status = isset($res['data']['status']) ? (string) $res['data']['status'] : $status;
-        $currency = isset($res['data']['currency']) ? (string) $res['data']['currency'] : $currency;
+    $liveKey = onepaycx_cb_is_live_key($apiKey);
+    if ($liveKey && array_key_exists('livemode', $data) && $data['livemode'] === false) {
+        $refuse('test payment on a live key');
     }
 
+    // Only a payment this module created is ever credited.
+    $local = OnePayCx_Whmcs_Store::findByPaymentId($paymentId);
+    if ($local === null) {
+        $refuse('unknown payment');
+    }
+
+    // Authoritative re-read, server-to-server with our own key: the notify is only
+    // a hint that something changed. A failure here is transient -> 502, retried.
+    $client = new OnePayCx_Whmcs_Client($apiKey);
+    $res = $client->getPayment($paymentId);
+    if (!$res['ok'] || !is_array($res['data'])) {
+        onepaycx_cb_respond(502, 'could not verify payment');
+    }
+    $row = $res['data'];
+    if (isset($row['id']) && (string) $row['id'] !== $paymentId) {
+        $refuse('payment id mismatch');
+    }
+    $status = isset($row['status']) ? (string) $row['status'] : '';
     if ($status !== 'paid') {
-        onepaycx_cb_respond(200, 'ignored: not paid');
+        // Not paid (yet): non-2xx so the delivery is retried.
+        onepaycx_cb_respond(409, 'payment not paid');
     }
-    if (!preg_match('/^\d{1,12}$/', $reference)) {
-        onepaycx_cb_respond(200, 'ignored: no invoice reference');
+    if ($liveKey && array_key_exists('livemode', $row) && $row['livemode'] === false) {
+        $refuse('test payment on a live key');
     }
-    if ($amount <= 0) {
-        onepaycx_cb_respond(400, 'missing amount');
+    $reference = isset($row['reference']) ? (string) $row['reference'] : '';
+    if ($reference !== (string) $local['invoice_id']) {
+        $refuse('invoice mismatch');
     }
+    $amount = isset($row['amount']) && is_numeric($row['amount']) ? (float) $row['amount'] : 0.0;
+    $currency = isset($row['currency']) ? (string) $row['currency'] : '';
 
     $reason = '';
-    $result = onepaycx_cb_credit($gw, (int) $reference, $paymentId, array('amount' => $amount, 'currency' => $currency), $payload, $reason);
+    $result = onepaycx_cb_credit($gw, (int) $local['invoice_id'], $paymentId, array('amount' => $amount, 'currency' => $currency), $payload, $reason);
     if ($result === 'refused') {
         // Acknowledged so 1pay.cx stops redelivering; the Gateway Log has the reason.
         onepaycx_cb_respond(200, 'ignored: ' . $reason);
@@ -366,6 +422,9 @@ function onepaycx_cb_return(array $gw)
                 continue;
             }
             $row = $res['data'];
+            if (onepaycx_cb_is_live_key($apiKey) && array_key_exists('livemode', $row) && $row['livemode'] === false) {
+                continue; // a live store never credits a test payment
+            }
             if (!isset($row['reference']) || (string) $row['reference'] !== (string) $invoiceId) {
                 continue; // not this invoice's payment; never credit it here
             }

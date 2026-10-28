@@ -19,7 +19,7 @@ $root = rtrim(sys_get_temp_dir(), '/') . '/onepaycx-whmcs-harness-' . getmypid()
 $log = $root . '/calls.log';
 $db = $root . '/db.json';
 $bodyFile = $root . '/body.bin';
-$apiKey = 'pk_test.harness-key-never-logged';
+$apiKey = 'pk_test_harness-key-never-logged';
 $secret1 = 'whsec_' . str_repeat('a', 48);
 $secret2 = 'whsec_' . str_repeat('b', 48);
 
@@ -107,6 +107,7 @@ function runScenario($name, array $env, $body = '')
         'ONEPAYCX_TEST_QUERY'     => '',
         'ONEPAYCX_TEST_METHOD'    => 'POST',
         'ONEPAYCX_TEST_SIG'       => '',
+        'ONEPAYCX_TEST_SIG2'      => '',
         'ONEPAYCX_TEST_CONVERTTO' => '',
         'ONEPAYCX_TEST_INACTIVE'  => '',
         'PATH'                    => getenv('PATH'),
@@ -211,7 +212,7 @@ check(strpos($r['link1'], '<form') === false, 'link() is an anchor, not a GET fo
 check(strpos($r['link1'], '>Pay with 1pay.cx</a>') !== false, 'link() renders the Pay with 1pay.cx button');
 check($r['link1'] === $r['link2'], 'second link() render is identical (reused checkout)');
 foreach (logOf($entries, 'http') as $h) {
-    check($h['host'] === 'api.1pay.cx' && $h['bearer'] === true && strpos($h['ua'], 'onepaycx-whmcs/1.0.0') === 0, 'HTTP call only to api.1pay.cx with bearer + UA (' . $h['method'] . ' ' . $h['path'] . ')');
+    check($h['host'] === 'api.1pay.cx' && $h['bearer'] === true && strpos($h['ua'], 'onepaycx-whmcs/1.1.0') === 0, 'HTTP call only to api.1pay.cx with bearer + UA (' . $h['method'] . ' ' . $h['path'] . ')');
 }
 $state = dbLoad();
 $secretRow = null;
@@ -267,14 +268,31 @@ list($code, $out, $entries) = runScenario('module', array('ONEPAYCX_TEST_TRANSPO
 
 /* ------------------------------------------------------------ 3. notify */
 
+$paidRow = function ($id, $ref, $amount, $status = 'paid', $currency = 'USD', $extra = array()) {
+    return array('method' => 'GET', 'path' => '/v1/payments/' . $id, 'status' => 200, 'body' => array('id' => $id, 'reference' => $ref, 'amount' => $amount, 'currency' => $currency, 'status' => $status) + $extra);
+};
+$seedRow = function ($id, $invoiceId, $amount, $currency = 'USD') {
+    $state = dbLoad();
+    $state['mod_onepaycx_payments'][] = array('id' => 200 + count($state['mod_onepaycx_payments']), 'invoice_id' => $invoiceId, 'payment_id' => $id, 'amount' => $amount, 'currency' => $currency, 'status' => 'pending', 'checkout_url' => 'https://1pay.cx/pay/' . $id, 'created_at' => date('Y-m-d H:i:s'));
+    dbSave($state);
+};
+$notifyBody = function ($id, $ref, $amount, array $extra = array()) {
+    return json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => $id, 'reference' => $ref, 'amount' => $amount, 'status' => 'paid') + $extra, 'at' => '2026-09-08T10:00:00.000Z'));
+};
+$v2 = function ($body, $secret, $t = null) {
+    $t = $t === null ? time() : $t;
+    return 't=' . $t . ',v1=' . hash_hmac('sha256', $t . '.' . $body, $secret);
+};
+
 // data.amount is the API's charged figure, which includes the merchant's customer
 // surcharge (here 3%): the invoice must be credited the 10.00 the module recorded.
-$paidBody = json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => 'pay_abc', 'reference' => '42', 'amount' => 10.3, 'valueForwarded' => 9.99, 'status' => 'paid'), 'at' => '2026-09-08T10:00:00.000Z'));
+$paidBody = json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => 'pay_abc', 'reference' => '42', 'amount' => 10.3, 'valueForwarded' => 9.99, 'status' => 'paid', 'livemode' => false), 'at' => '2026-09-08T10:00:00.000Z'));
 $sig = hash_hmac('sha256', $paidBody, $secret1);
 
-list($code, $out, $entries) = runScenario('notify-ok', array('ONEPAYCX_TEST_SIG' => $sig), $paidBody);
+list($code, $out, $entries) = runScenario('notify-ok', array('ONEPAYCX_TEST_SIG' => $sig, 'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_abc', '42', 10.3)))), $paidBody);
 check($code === 0 && trim($out) === 'ok', 'valid notify -> "ok"');
 check(count(httpCalls($entries, 'GET', '/v1/me')) === 0, 'cached secret used: no /v1/me call');
+check(count(httpCalls($entries, 'GET', '/v1/payments/pay_abc')) === 1, 'notify re-reads GET /v1/payments/pay_abc before crediting');
 check(count(logOf($entries, 'checkCbInvoiceID')) === 1 && logOf($entries, 'checkCbInvoiceID')[0]['invoiceId'] === 42, 'checkCbInvoiceID(42)');
 check(count(logOf($entries, 'checkCbTransID')) === 1 && logOf($entries, 'checkCbTransID')[0]['transId'] === 'pay_abc', 'checkCbTransID(pay_abc)');
 $lt = logOf($entries, 'logTransaction');
@@ -287,7 +305,7 @@ $state = dbLoad();
 check($state['mod_onepaycx_payments'][0]['status'] === 'paid', 'local payment row marked paid');
 
 // Same notify again (at-least-once) -> no double credit.
-list($code, $out, $entries) = runScenario('notify-dup', array('ONEPAYCX_TEST_SIG' => $sig), $paidBody);
+list($code, $out, $entries) = runScenario('notify-dup', array('ONEPAYCX_TEST_SIG' => $sig, 'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_abc', '42', 10.3)))), $paidBody);
 check($code === 0 && trim($out) === 'already processed', 'duplicate notify -> "already processed"');
 check(count(logOf($entries, 'addInvoicePayment')) === 0, 'duplicate notify does not credit again');
 
@@ -311,11 +329,12 @@ foreach ($state['tblpaymentgateways'] as $i => $row) {
     }
 }
 dbSave($state);
-$paidBody2 = json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => 'pay_def', 'reference' => '43', 'amount' => 5.5, 'status' => 'paid'), 'at' => '2026-09-08T10:05:00.000Z'));
+$seedRow('pay_def', 43, '5.50');
+$paidBody2 = $notifyBody('pay_def', '43', 5.5);
 $sig2 = hash_hmac('sha256', $paidBody2, $secret2);
 list($code, $out, $entries) = runScenario('notify-rotated', array(
     'ONEPAYCX_TEST_SIG' => $sig2,
-    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array(array('method' => 'GET', 'path' => '/v1/me', 'status' => 200, 'body' => array('id' => 'm_1', 'webhookSecret' => $secret2)))),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array(array('method' => 'GET', 'path' => '/v1/me', 'status' => 200, 'body' => array('id' => 'm_1', 'webhookSecret' => $secret2)), $paidRow('pay_def', '43', 5.5))),
 ), $paidBody2);
 check(trim($out) === 'ok', 'rotated secret: refetched from /v1/me and verified');
 check(count(httpCalls($entries, 'GET', '/v1/me')) === 1, 'rotated secret: exactly one /v1/me call');
@@ -323,32 +342,116 @@ $aip = logOf($entries, 'addInvoicePayment');
 check(count($aip) === 1 && $aip[0]['invoiceId'] === 43 && $aip[0]['amount'] === '5.50', 'rotated secret: invoice 43 credited 5.50');
 
 // Uppercase hex signature is accepted too.
-$paidBody3 = json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => 'pay_ghi', 'reference' => '47', 'amount' => 1, 'status' => 'paid'), 'at' => '2026-09-08T10:06:00.000Z'));
-list($code, $out, $entries) = runScenario('notify-upper', array('ONEPAYCX_TEST_SIG' => strtoupper(hash_hmac('sha256', $paidBody3, $secret2))), $paidBody3);
+$seedRow('pay_ghi', 43, '1.00');
+$paidBody3 = $notifyBody('pay_ghi', '43', 1);
+list($code, $out, $entries) = runScenario('notify-upper', array('ONEPAYCX_TEST_SIG' => strtoupper(hash_hmac('sha256', $paidBody3, $secret2)), 'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_ghi', '43', 1)))), $paidBody3);
 check(trim($out) === 'ok', 'upper-case hex signature accepted');
 
 // Other events are acknowledged and ignored.
-$other = json_encode(array('event' => 'card.issued', 'data' => array('id' => 'vcc_1'), 'at' => '2026-09-08T10:07:00.000Z'));
+$other = json_encode(array('event' => 'payment.expired', 'data' => array('paymentId' => 'pay_x'), 'at' => '2026-09-08T10:07:00.000Z'));
 list($code, $out, $entries) = runScenario('notify-ignored', array('ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $other, $secret2)), $other);
 check(trim($out) === 'ignored' && count(logOf($entries, 'addInvoicePayment')) === 0, 'non-payment event -> "ignored"');
 
-// Partial payload (no reference/amount) -> looked up via GET /v1/payments/{id}.
-$partial = json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => 'pay_jkl'), 'at' => '2026-09-08T10:08:00.000Z'));
-list($code, $out, $entries) = runScenario('notify-partial', array(
-    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $partial, $secret2),
-    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array(array('method' => 'GET', 'path' => '/v1/payments/pay_jkl', 'status' => 200, 'body' => array('id' => 'pay_jkl', 'reference' => '46', 'amount' => 3, 'currency' => 'USD', 'status' => 'paid')))),
-), $partial);
-$aip = logOf($entries, 'addInvoicePayment');
-check(trim($out) === 'ok' && count($aip) === 1 && $aip[0]['invoiceId'] === 46 && $aip[0]['amount'] === '3.00', 'partial payload resolved via GET /v1/payments/{id}');
+// A payment this module never recorded is refused outright, without an API call.
+$unknown = $notifyBody('pay_jkl', '46', 3);
+list($code, $out, $entries) = runScenario('notify-unknown', array(
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $unknown, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_jkl', '46', 3))),
+), $unknown);
+check(trim($out) === 'ignored: unknown payment' && count(logOf($entries, 'addInvoicePayment')) === 0, 'no local record -> "ignored: unknown payment", no credit');
+check(count(logOf($entries, 'http')) === 0, 'no local record -> no API call');
 
-// No local row and the API row is in another currency than the invoice expects -> refused, not credited.
-$partialMis = json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => 'pay_mis'), 'at' => '2026-09-08T10:09:00.000Z'));
+// V2 header: valid and fresh -> credited (the legacy header is not needed).
+$seedRow('pay_v2a', 43, '2.00');
+$bodyV2 = $notifyBody('pay_v2a', '43', 2);
+list($code, $out, $entries) = runScenario('notify-v2', array('ONEPAYCX_TEST_SIG2' => $v2($bodyV2, $secret2), 'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_v2a', '43', 2)))), $bodyV2);
+check(trim($out) === 'ok' && count(logOf($entries, 'addInvoicePayment')) === 1, 'V2 signature (fresh) -> credited');
+
+// V2 wins over legacy: a valid legacy header does not rescue a stale V2 (replay).
+$seedRow('pay_v2b', 43, '2.00');
+$bodyV2b = $notifyBody('pay_v2b', '43', 2);
+list($code, $out, $entries) = runScenario('notify-v2-stale', array(
+    'ONEPAYCX_TEST_SIG2' => $v2($bodyV2b, $secret2, time() - 301),
+    'ONEPAYCX_TEST_SIG'  => hash_hmac('sha256', $bodyV2b, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_v2b', '43', 2))),
+), $bodyV2b);
+check(trim($out) === 'bad signature' && count(logOf($entries, 'addInvoicePayment')) === 0, 'V2 timestamp 301 s old -> "bad signature" even with a valid legacy header');
+list($code, $out, $entries) = runScenario('notify-v2-future', array('ONEPAYCX_TEST_SIG2' => $v2($bodyV2b, $secret2, time() + 400)), $bodyV2b);
+check(trim($out) === 'bad signature', 'V2 timestamp 400 s in the future -> "bad signature"');
+list($code, $out, $entries) = runScenario('notify-v2-wrong', array('ONEPAYCX_TEST_SIG2' => $v2($bodyV2b, $secret1)), $bodyV2b);
+check(trim($out) === 'bad signature', 'V2 under the wrong secret -> "bad signature"');
+list($code, $out, $entries) = runScenario('notify-v2-malformed', array('ONEPAYCX_TEST_SIG2' => 'v1=abc', 'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodyV2b, $secret2)), $bodyV2b);
+check(trim($out) === 'missing signature', 'malformed V2 header -> "missing signature" (no fallback to legacy)');
+
+// Currency mismatch between the record (USD) and the API row (EUR) -> refused.
+$seedRow('pay_mis', 43, '3.00');
+$bodyMis = $notifyBody('pay_mis', '43', 3);
 list($code, $out, $entries) = runScenario('notify-currency-mismatch', array(
-    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $partialMis, $secret2),
-    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array(array('method' => 'GET', 'path' => '/v1/payments/pay_mis', 'status' => 200, 'body' => array('id' => 'pay_mis', 'reference' => '47', 'amount' => 3, 'currency' => 'EUR', 'status' => 'paid')))),
-), $partialMis);
-check(trim($out) === 'ignored: currency mismatch' && count(logOf($entries, 'addInvoicePayment')) === 0, 'currency mismatch (EUR payment, USD invoice) -> "ignored: currency mismatch", no credit');
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodyMis, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_mis', '43', 3, 'paid', 'EUR'))),
+), $bodyMis);
+check(trim($out) === 'ignored: currency mismatch' && count(logOf($entries, 'addInvoicePayment')) === 0, 'currency mismatch (EUR payment, USD record) -> "ignored: currency mismatch", no credit');
 check(count(logOf($entries, 'logTransaction')) === 1 && logOf($entries, 'logTransaction')[0]['result'] === 'Unsuccessful', 'currency mismatch logged as Unsuccessful');
+
+// Short payment -> refused; 0.01 rounding tolerated.
+$seedRow('pay_sht', 43, '10.00');
+$bodySht = $notifyBody('pay_sht', '43', 9.5);
+list($code, $out, $entries) = runScenario('notify-short', array(
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodySht, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_sht', '43', 9.5))),
+), $bodySht);
+check(trim($out) === 'ignored: amount mismatch' && count(logOf($entries, 'addInvoicePayment')) === 0, 'API amount 9.50 < recorded 10.00 -> "ignored: amount mismatch"');
+list($code, $out, $entries) = runScenario('notify-rounding', array(
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodySht, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_sht', '43', 9.995))),
+), $bodySht);
+$aip = logOf($entries, 'addInvoicePayment');
+check(trim($out) === 'ok' && count($aip) === 1 && $aip[0]['amount'] === '10.00', 'API amount 9.995 vs recorded 10.00 (rounding) -> credited 10.00');
+
+// Signed notify but the API says it is not paid (or the read fails) -> non-2xx, retried, no credit.
+$seedRow('pay_npd', 43, '2.00');
+$bodyNpd = $notifyBody('pay_npd', '43', 2);
+list($code, $out, $entries) = runScenario('notify-not-paid', array(
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodyNpd, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_npd', '43', 2, 'pending'))),
+), $bodyNpd);
+check(trim($out) === 'payment not paid' && count(logOf($entries, 'addInvoicePayment')) === 0, 'API status pending -> "payment not paid", no credit');
+list($code, $out, $entries) = runScenario('notify-api-down', array(
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodyNpd, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array(array('method' => 'GET', 'path' => '/v1/payments/pay_npd', 'status' => 503, 'body' => array('error' => 'down')))),
+), $bodyNpd);
+check(trim($out) === 'could not verify payment' && count(logOf($entries, 'addInvoicePayment')) === 0, 'API read fails -> "could not verify payment", no credit');
+
+// API row says another invoice -> refused.
+list($code, $out, $entries) = runScenario('notify-ref-mismatch', array(
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodyNpd, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_npd', '999', 2))),
+), $bodyNpd);
+check(trim($out) === 'ignored: invoice mismatch' && count(logOf($entries, 'addInvoicePayment')) === 0, 'API reference differs from the recorded invoice -> "ignored: invoice mismatch"');
+
+// Live key: a test payment is refused (from the body, and from the API row).
+$liveKey = 'pk_live_harness-key';
+$meLive = array('method' => 'GET', 'path' => '/v1/me', 'status' => 200, 'body' => array('id' => 'm_1', 'webhookSecret' => $secret2, 'livemode' => true));
+$bodyLiveTest = $notifyBody('pay_npd', '43', 2, array('livemode' => false));
+list($code, $out, $entries) = runScenario('notify-live-testbody', array(
+    'ONEPAYCX_TEST_APIKEY' => $liveKey,
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodyLiveTest, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($meLive, $paidRow('pay_npd', '43', 2))),
+), $bodyLiveTest);
+check(trim($out) === 'ignored: test payment on a live key' && count(logOf($entries, 'addInvoicePayment')) === 0, 'live key + livemode:false notify -> refused');
+check(count(httpCalls($entries, 'GET', '/v1/payments/pay_npd')) === 0, 'live key + livemode:false notify -> no payment re-read');
+list($code, $out, $entries) = runScenario('notify-live-testrow', array(
+    'ONEPAYCX_TEST_APIKEY' => $liveKey,
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodyNpd, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($meLive, $paidRow('pay_npd', '43', 2, 'paid', 'USD', array('livemode' => false)))),
+), $bodyNpd);
+check(trim($out) === 'ignored: test payment on a live key' && count(logOf($entries, 'addInvoicePayment')) === 0, 'live key + API row livemode:false -> refused');
+list($code, $out, $entries) = runScenario('notify-live-ok', array(
+    'ONEPAYCX_TEST_APIKEY' => $liveKey,
+    'ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $bodyNpd, $secret2),
+    'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($meLive, $paidRow('pay_npd', '43', 2, 'paid', 'USD', array('livemode' => true)))),
+), $bodyNpd);
+check(trim($out) === 'ok' && count(logOf($entries, 'addInvoicePayment')) === 1, 'live key + livemode:true -> credited');
 
 // Concurrency lock: a row another request is crediting right now is a duplicate; a stale
 // lock (request died mid-credit) is taken over and credited with the recorded amount.
@@ -356,11 +459,11 @@ $state = dbLoad();
 $state['mod_onepaycx_payments'][] = array('id' => 90, 'invoice_id' => 48, 'payment_id' => 'pay_lck', 'amount' => '4.00', 'currency' => 'USD', 'status' => 'crediting', 'checkout_url' => 'https://1pay.cx/pay/pay_lck', 'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s'));
 $state['mod_onepaycx_payments'][] = array('id' => 91, 'invoice_id' => 49, 'payment_id' => 'pay_stl', 'amount' => '4.00', 'currency' => 'USD', 'status' => 'crediting', 'checkout_url' => 'https://1pay.cx/pay/pay_stl', 'created_at' => date('Y-m-d H:i:s', time() - 900), 'updated_at' => date('Y-m-d H:i:s', time() - 600));
 dbSave($state);
-$lockBody = json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => 'pay_lck', 'reference' => '48', 'amount' => 4.12, 'status' => 'paid'), 'at' => '2026-09-08T10:10:00.000Z'));
-list($code, $out, $entries) = runScenario('notify-locked', array('ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $lockBody, $secret2)), $lockBody);
+$lockBody = $notifyBody('pay_lck', '48', 4.12);
+list($code, $out, $entries) = runScenario('notify-locked', array('ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $lockBody, $secret2), 'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($meLive, $paidRow('pay_lck', '48', 4.12)))), $lockBody);
 check(trim($out) === 'already processed' && count(logOf($entries, 'addInvoicePayment')) === 0, 'row being credited by another request -> "already processed", no second credit');
-$staleBody = json_encode(array('event' => 'payment.paid', 'data' => array('paymentId' => 'pay_stl', 'reference' => '49', 'amount' => 4.12, 'status' => 'paid'), 'at' => '2026-09-08T10:11:00.000Z'));
-list($code, $out, $entries) = runScenario('notify-stale-lock', array('ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $staleBody, $secret2)), $staleBody);
+$staleBody = $notifyBody('pay_stl', '49', 4.12);
+list($code, $out, $entries) = runScenario('notify-stale-lock', array('ONEPAYCX_TEST_SIG' => hash_hmac('sha256', $staleBody, $secret2), 'ONEPAYCX_TEST_TRANSPORT' => json_encode(array($paidRow('pay_stl', '49', 4.12)))), $staleBody);
 $aip = logOf($entries, 'addInvoicePayment');
 check(trim($out) === 'ok' && count($aip) === 1 && $aip[0]['invoiceId'] === 49 && $aip[0]['amount'] === '4.00', 'stale crediting lock (10 min old) is taken over and credited the recorded 4.00');
 $state = dbLoad();
@@ -382,9 +485,6 @@ $state['mod_onepaycx_payments'][] = array('id' => 100, 'invoice_id' => 45, 'paym
 $state['mod_onepaycx_payments'][] = array('id' => 101, 'invoice_id' => 47, 'payment_id' => 'pay_oth', 'amount' => '7.00', 'currency' => 'USD', 'status' => 'pending', 'checkout_url' => 'https://1pay.cx/pay/pay_oth', 'created_at' => date('Y-m-d H:i:s'));
 dbSave($state);
 
-$paidRow = function ($id, $ref, $amount, $status = 'paid', $currency = 'USD') {
-    return array('method' => 'GET', 'path' => '/v1/payments/' . $id, 'status' => 200, 'body' => array('id' => $id, 'reference' => $ref, 'amount' => $amount, 'currency' => $currency, 'status' => $status));
-};
 
 list($code, $out, $entries) = runScenario('return-paid', array(
     'ONEPAYCX_TEST_METHOD' => 'GET', 'ONEPAYCX_TEST_QUERY' => 'action=return&invoiceid=44',
